@@ -343,6 +343,8 @@ function printImage(fileBuffer, filename, devicePath, res) {
 }
 
 const server = http.createServer((req, res) => {
+  console.log(`[REQ] ${req.method} ${req.url}`);
+
   // CORS headers
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
@@ -390,6 +392,7 @@ const server = http.createServer((req, res) => {
       return res.end("Error: expected multipart/form-data");
     }
 
+    console.log("[UPLOAD] Receiving file data...");
     let size = 0;
     const chunks = [];
     req.on("data", (chunk) => {
@@ -403,15 +406,18 @@ const server = http.createServer((req, res) => {
       chunks.push(chunk);
     });
     req.on("end", () => {
+      console.log(`[UPLOAD] Received ${size} bytes`);
       if (res.writableEnded) return;
 
       const body = Buffer.concat(chunks);
       const parsed = parseMultipart(body, contentType);
       if (!parsed || !parsed.data.length) {
+        console.log("[UPLOAD] Parse failed — no file found");
         res.writeHead(400, { "Content-Type": "text/plain" });
         return res.end("Error: no file uploaded");
       }
 
+      console.log(`[UPLOAD] Parsed file: ${parsed.filename} (${parsed.data.length} bytes)`);
       const ext = path.extname(parsed.filename).toLowerCase();
       if (!ALLOWED_EXTENSIONS.includes(ext)) {
         res.writeHead(400, { "Content-Type": "text/plain" });
