@@ -6,50 +6,12 @@ const fs = require("fs");
 
 const PORT = 9101;
 
-// Detect USB Zebra printer via system_profiler or ioreg
-function findUsbZebraPrinter() {
-  // Try system_profiler first
-  try {
-    const output = execSync("system_profiler SPUSBDataType 2>/dev/null").toString();
-    // Zebra vendor ID is 0x0a5f
-    const zebraSection = output.split(/\n\n/).find(
-      (section) => /0x0a5f/i.test(section) || /zebra/i.test(section)
-    );
-    if (zebraSection) {
-      const productMatch = zebraSection.match(/^\s*(.+?):\s*$/m);
-      const serialMatch = zebraSection.match(/Serial Number:\s*(\S+)/i);
-      return {
-        found: true,
-        productName: productMatch ? productMatch[1].trim() : "Zebra Printer",
-        serialNumber: serialMatch ? serialMatch[1] : null,
-      };
-    }
-  } catch {}
-
-  // Fallback to ioreg
-  try {
-    const output = execSync("ioreg -p IOUSB -l -w0 2>/dev/null").toString();
-    // Zebra vendor ID 0x0A5F = 2655 decimal
-    if (/\"idVendor\"\s*=\s*2655/.test(output)) {
-      const nameMatch = output.match(/\"USB Product Name\"\s*=\s*\"([^\"]+)\"/);
-      const serialMatch = output.match(/\"USB Serial Number\"\s*=\s*\"([^\"]+)\"/);
-      return {
-        found: true,
-        productName: nameMatch ? nameMatch[1] : "Zebra Printer",
-        serialNumber: serialMatch ? serialMatch[1] : null,
-      };
-    }
-  } catch {}
-
-  return { found: false };
-}
-
-// Auto-register a detected USB Zebra printer in CUPS as a raw queue
-function autoRegisterZebraInCups() {
+// Auto-register any USB printer found via lpinfo as a raw CUPS queue
+function autoRegisterUsbPrinter() {
   try {
     const output = execSync("lpinfo -v 2>/dev/null").toString();
     const usbLine = output.split("\n").find(
-      (line) => /^direct\s+usb:\/\//.test(line) && /zebra/i.test(line)
+      (line) => /^direct\s+usb:\/\//.test(line)
     );
     if (!usbLine) return null;
 
@@ -57,7 +19,9 @@ function autoRegisterZebraInCups() {
     if (!uriMatch) return null;
 
     const uri = uriMatch[1];
-    const queueName = "ZebraPrinter";
+    // Derive queue name from URI path (e.g. "ITPP130" from usb://Printer/ITPP130?serial=...)
+    const pathMatch = uri.match(/usb:\/\/[^/]+\/([^?]+)/);
+    const queueName = pathMatch ? pathMatch[1] : "USBPrinter";
 
     execSync(
       `lpadmin -p ${queueName} -E -v "${uri}" -m raw 2>/dev/null`
@@ -65,15 +29,19 @@ function autoRegisterZebraInCups() {
     console.log(`Auto-registered CUPS queue "${queueName}" -> ${uri}`);
     return queueName;
   } catch (e) {
-    console.error("Failed to auto-register Zebra in CUPS:", e.message);
+    console.error("Failed to auto-register USB printer in CUPS:", e.message);
     return null;
   }
 }
 
-// Find a Zebra serial device (CDC serial mode)
-function findZebraSerialDevice() {
+// Find any non-system serial device
+function findSerialDevice() {
+  const SYSTEM_DEVICES = ["Bluetooth", "debug-console", "wlan"];
   try {
-    const files = fs.readdirSync("/dev").filter((f) => f.startsWith("cu.usbmodem"));
+    const files = fs.readdirSync("/dev").filter((f) => {
+      if (!f.startsWith("cu.")) return false;
+      return !SYSTEM_DEVICES.some((sys) => f.includes(sys));
+    });
     if (files.length > 0) return `/dev/${files[0]}`;
   } catch {}
   return null;
@@ -96,16 +64,12 @@ function findPrinter() {
   const cupsName = findCupsPrinter();
   if (cupsName) return { type: "cups", printer: cupsName };
 
-  // Tier 2: USB Zebra detected — try to auto-register in CUPS
-  const usb = findUsbZebraPrinter();
-  if (usb.found) {
-    console.log(`Detected USB Zebra: ${usb.productName}${usb.serialNumber ? ` (S/N: ${usb.serialNumber})` : ""}`);
-    const queue = autoRegisterZebraInCups();
-    if (queue) return { type: "cups", printer: queue };
-  }
+  // Tier 2: USB printer detected via lpinfo — auto-register in CUPS
+  const queue = autoRegisterUsbPrinter();
+  if (queue) return { type: "cups", printer: queue };
 
-  // Tier 3: Serial device fallback (CDC serial mode)
-  const serialDev = findZebraSerialDevice();
+  // Tier 3: Serial device fallback
+  const serialDev = findSerialDevice();
   if (serialDev) return { type: "serial", device: serialDev };
 
   return null;
@@ -128,9 +92,9 @@ const PRINTER_INFO = resolvePrinter();
 if (!PRINTER_INFO) {
   console.error(
     [
-      "No Zebra printer detected. Options:",
-      "  1. Connect a Zebra printer via USB",
-      "  2. Set up a raw CUPS queue: lpadmin -p ZebraPrinter -E -v <uri> -m raw",
+      "No USB printer detected. Options:",
+      "  1. Connect a thermal printer via USB",
+      "  2. Set up a raw CUPS queue: lpadmin -p PrinterName -E -v <uri> -m raw",
       "  3. Set ZPL_PRINTER env var to a CUPS queue name or /dev/ serial path",
       "  4. Run: lpinfo -v   to list available printer URIs",
     ].join("\n")
