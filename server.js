@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const http = require("http");
-const { execSync } = require("child_process");
+const { exec, execSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -32,13 +32,18 @@ function resolvePrinter() {
 
 let serialConfigured = false;
 
-// Configure serial port and write payload directly to the device
-function sendToDevice(devicePath, payload) {
+// Configure serial port and write payload directly to the device (async)
+function sendToDevice(devicePath, payload, callback) {
   if (!serialConfigured) {
     execSync(`stty -f "${devicePath}" 9600 cs8 -cstopb -parenb`);
     serialConfigured = true;
   }
-  fs.writeFileSync(devicePath, payload);
+  const tmpFile = path.join(os.tmpdir(), `tspl-${Date.now()}.bin`);
+  fs.writeFileSync(tmpFile, payload);
+  exec(`cat "${tmpFile}" > "${devicePath}"`, (err) => {
+    try { fs.unlinkSync(tmpFile); } catch {}
+    callback(err);
+  });
 }
 
 const PRINTER_DEVICE = resolvePrinter();
@@ -312,14 +317,20 @@ function printImage(fileBuffer, filename, devicePath, res) {
     const widthBytes = Math.ceil(width / 8);
     const payload = buildTsplPayload(bitmap, widthBytes, height, width);
 
-    // 4. Send directly to device
-    sendToDevice(devicePath, payload);
-    cleanup();
-
-    const msg = `Sent ${filename} to ${devicePath} (TSPL ${width}x${height})`;
-    console.log(msg);
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end(msg);
+    // 4. Send directly to device (async — doesn't block event loop)
+    sendToDevice(devicePath, payload, (err) => {
+      cleanup();
+      if (err) {
+        console.error("Device write error:", err.message);
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end(`Error writing to device: ${err.message}`);
+        return;
+      }
+      const msg = `Sent ${filename} to ${devicePath} (TSPL ${width}x${height})`;
+      console.log(msg);
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end(msg);
+    });
   } catch (e) {
     cleanup();
     console.error("TSPL conversion error:", e.message);
@@ -355,11 +366,18 @@ const server = http.createServer((req, res) => {
       `PRINT 1\r\n`;
 
     try {
-      sendToDevice(PRINTER_DEVICE, Buffer.from(tspl, "ascii"));
-      const msg = `Test print sent to ${PRINTER_DEVICE}`;
-      console.log(msg);
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end(msg);
+      sendToDevice(PRINTER_DEVICE, Buffer.from(tspl, "ascii"), (err) => {
+        if (err) {
+          console.error("Test print error:", err.message);
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          res.end(`Test print error: ${err.message}`);
+          return;
+        }
+        const msg = `Test print sent to ${PRINTER_DEVICE}`;
+        console.log(msg);
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end(msg);
+      });
     } catch (e) {
       console.error("Test print error:", e.message);
       res.writeHead(500, { "Content-Type": "text/plain" });
