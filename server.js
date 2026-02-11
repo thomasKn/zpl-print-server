@@ -30,11 +30,23 @@ function resolvePrinter() {
   return findPrinterDevice();
 }
 
-// Write payload to the device (async, fire-and-forget)
+let serialConfigured = false;
+
+// Configure serial port and write payload directly to the device (async, fire-and-forget)
 function sendToDevice(devicePath, payload) {
-  fs.writeFile(devicePath, payload, (err) => {
-    if (err) console.error("Device write error:", err.message);
-    else console.log("[DEVICE] Write complete");
+  if (!serialConfigured) {
+    execSync(`stty -f "${devicePath}" 9600 cs8 -cstopb -parenb`);
+    serialConfigured = true;
+  }
+  fs.open(devicePath, "w", (err, fd) => {
+    if (err) {
+      console.error("Failed to open device:", err.message);
+      return;
+    }
+    fs.write(fd, payload, (err) => {
+      if (err) console.error("Failed to write to device:", err.message);
+      fs.close(fd, () => {});
+    });
   });
 }
 
@@ -52,8 +64,6 @@ if (!PRINTER_DEVICE) {
   process.exit(1);
 }
 
-// Configure serial port at startup (one-time)
-execSync(`stty -f "${PRINTER_DEVICE}" 9600 cs8 -cstopb -parenb`);
 console.log(`Using printer: ${PRINTER_DEVICE} (direct serial)`);
 
 const HTML = `<!DOCTYPE html>
