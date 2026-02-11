@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const http = require("http");
-const { execSync, exec } = require("child_process");
+const { execSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -10,47 +10,8 @@ const PORT = 9101;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MB
 const ALLOWED_EXTENSIONS = [".png", ".jpg", ".jpeg", ".pdf"];
 
-// Auto-register any USB printer found via lpinfo as an image-capable CUPS queue
-function autoRegisterUsbPrinter() {
-  try {
-    const output = execSync("lpinfo -v 2>/dev/null").toString();
-    const usbLine = output
-      .split("\n")
-      .find((line) => /^direct\s+usb:\/\//.test(line));
-    if (!usbLine) return null;
-
-    const uriMatch = usbLine.match(/\s(usb:\/\/\S+)/);
-    if (!uriMatch) return null;
-
-    const uri = uriMatch[1];
-    // Derive queue name from URI path (e.g. "ITPP130" from usb://Printer/ITPP130?serial=...)
-    const pathMatch = uri.match(/usb:\/\/[^/]+\/([^?]+)/);
-    const queueName = pathMatch ? pathMatch[1] : "USBPrinter";
-
-    // Use -m raw so CUPS passes our TSPL bytes through unchanged
-    try {
-      execSync(
-        `lpadmin -p ${queueName} -E -v "${uri}" -m raw 2>/dev/null`
-      );
-      console.log(
-        `Auto-registered CUPS queue "${queueName}" -> ${uri} (raw mode)`
-      );
-      return queueName;
-    } catch (e) {
-      console.error(
-        "Failed to auto-register USB printer in CUPS:",
-        e.message
-      );
-      return null;
-    }
-  } catch (e) {
-    console.error("Failed to auto-register USB printer in CUPS:", e.message);
-    return null;
-  }
-}
-
-// Find any non-system serial device (informational only)
-function findSerialDevice() {
+// Find a serial device for the thermal printer
+function findPrinterDevice() {
   const SYSTEM_DEVICES = ["Bluetooth", "debug-console", "wlan"];
   try {
     const files = fs.readdirSync("/dev").filter((f) => {
@@ -62,68 +23,39 @@ function findSerialDevice() {
   return null;
 }
 
-// Find a CUPS printer
-function findCupsPrinter() {
-  try {
-    const output = execSync("lpstat -p 2>/dev/null").toString();
-    const match = output.match(/^printer\s+(\S+)/m);
-    if (match) return match[1];
-  } catch {}
-  return null;
-}
-
-// Printer detection — CUPS only (serial is informational)
-function findPrinter() {
-  // Tier 1: CUPS printer already configured
-  const cupsName = findCupsPrinter();
-  if (cupsName) return cupsName;
-
-  // Tier 2: USB printer detected via lpinfo — auto-register in CUPS
-  const queue = autoRegisterUsbPrinter();
-  if (queue) return queue;
-
-  // Informational: mention serial device if found
-  const serialDev = findSerialDevice();
-  if (serialDev) {
-    console.log(
-      `Serial device found at ${serialDev}, but CUPS is required for image printing.`
-    );
-  }
-
-  return null;
-}
-
-// Resolve printer from env var or auto-detection
+// Resolve printer device from env var or auto-detection
 function resolvePrinter() {
   const envVal = process.env.LABEL_PRINTER;
-  if (envVal) {
-    if (envVal.startsWith("/dev/")) {
-      console.error(
-        "Error: LABEL_PRINTER points to a serial device. Only CUPS queue names are supported."
-      );
-      process.exit(1);
-    }
-    return envVal;
-  }
-  return findPrinter();
+  if (envVal) return envVal;
+  return findPrinterDevice();
 }
 
-const PRINTER_NAME = resolvePrinter();
+let serialConfigured = false;
 
-if (!PRINTER_NAME) {
+// Configure serial port and write payload directly to the device
+function sendToDevice(devicePath, payload) {
+  if (!serialConfigured) {
+    execSync(`stty -f "${devicePath}" 9600 cs8 -cstopb -parenb`);
+    serialConfigured = true;
+  }
+  fs.writeFileSync(devicePath, payload);
+}
+
+const PRINTER_DEVICE = resolvePrinter();
+
+if (!PRINTER_DEVICE) {
   console.error(
     [
-      "No USB printer detected. Options:",
-      "  1. Connect a thermal printer via USB",
-      "  2. Set up a CUPS queue: lpadmin -p PrinterName -E -v <uri> -m raw",
-      "  3. Set LABEL_PRINTER env var to a CUPS queue name",
-      "  4. Run: lpinfo -v   to list available printer URIs",
+      "No thermal printer detected. Options:",
+      "  1. Connect a thermal printer via USB (appears as /dev/cu.ITPP*)",
+      "  2. Set LABEL_PRINTER env var to a device path, e.g.:",
+      "     LABEL_PRINTER=/dev/cu.ITPP130B-D9C3 node server.js",
     ].join("\n")
   );
   process.exit(1);
 }
 
-console.log(`Using printer: ${PRINTER_NAME} (CUPS)`);
+console.log(`Using printer: ${PRINTER_DEVICE} (direct serial)`);
 
 const HTML = `<!DOCTYPE html>
 <html><head><title>Label Print Server</title>
@@ -148,7 +80,7 @@ const HTML = `<!DOCTYPE html>
 </style></head>
 <body>
   <h1>Label Print Server</h1>
-  <p>Printer: <strong>${PRINTER_NAME}</strong></p>
+  <p>Printer: <strong>${PRINTER_DEVICE}</strong></p>
 
   <div class="drop-zone" id="dropZone">
     <p>Drag & drop an image or PDF here, or click to browse</p>
@@ -353,16 +285,15 @@ function buildTsplPayload(bitmap, widthBytes, height, widthDots) {
   return Buffer.concat([headerBuf, bitmap, footerBuf]);
 }
 
-// Print an image/PDF file via TSPL over CUPS raw queue
-function printImage(fileBuffer, filename, printer, res) {
+// Print an image/PDF file via TSPL direct to serial device
+function printImage(fileBuffer, filename, devicePath, res) {
   const stamp = Date.now();
   const ext = path.extname(filename).toLowerCase();
   const tmpInput = path.join(os.tmpdir(), `label-${stamp}${ext}`);
   const tmpBmp = path.join(os.tmpdir(), `label-${stamp}.bmp`);
-  const tmpTspl = path.join(os.tmpdir(), `label-${stamp}.tspl`);
 
   const cleanup = () => {
-    for (const f of [tmpInput, tmpBmp, tmpTspl]) {
+    for (const f of [tmpInput, tmpBmp]) {
       try { fs.unlinkSync(f); } catch {}
     }
   };
@@ -381,25 +312,14 @@ function printImage(fileBuffer, filename, printer, res) {
     const widthBytes = Math.ceil(width / 8);
     const payload = buildTsplPayload(bitmap, widthBytes, height, width);
 
-    // 4. Write TSPL payload to temp file
-    fs.writeFileSync(tmpTspl, payload);
+    // 4. Send directly to device
+    sendToDevice(devicePath, payload);
+    cleanup();
 
-    // 5. Send via lp raw
-    exec(
-      `lp -d "${printer}" -o raw "${tmpTspl}"`,
-      (err, stdout, stderr) => {
-        cleanup();
-        if (err) {
-          console.error("Print error:", stderr || err.message);
-          res.writeHead(500, { "Content-Type": "text/plain" });
-          return res.end(`Print error: ${stderr || err.message}`);
-        }
-        const msg = `Sent ${filename} to ${printer} (TSPL ${width}x${height}): ${stdout.trim()}`;
-        console.log(msg);
-        res.writeHead(200, { "Content-Type": "text/plain" });
-        res.end(msg);
-      }
-    );
+    const msg = `Sent ${filename} to ${devicePath} (TSPL ${width}x${height})`;
+    console.log(msg);
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end(msg);
   } catch (e) {
     cleanup();
     console.error("TSPL conversion error:", e.message);
@@ -434,21 +354,17 @@ const server = http.createServer((req, res) => {
       `TEXT 50,10,"4",0,1,1,"TSPL TEST OK"\r\n` +
       `PRINT 1\r\n`;
 
-    const tmpFile = path.join(os.tmpdir(), `test-${Date.now()}.tspl`);
-    fs.writeFileSync(tmpFile, tspl, "ascii");
-
-    exec(`lp -d "${PRINTER_NAME}" -o raw "${tmpFile}"`, (err, stdout, stderr) => {
-      try { fs.unlinkSync(tmpFile); } catch {}
-      if (err) {
-        console.error("Test print error:", stderr || err.message);
-        res.writeHead(500, { "Content-Type": "text/plain" });
-        return res.end(`Test print error: ${stderr || err.message}`);
-      }
-      const msg = `Test print sent to ${PRINTER_NAME}: ${stdout.trim()}`;
+    try {
+      sendToDevice(PRINTER_DEVICE, Buffer.from(tspl, "ascii"));
+      const msg = `Test print sent to ${PRINTER_DEVICE}`;
       console.log(msg);
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end(msg);
-    });
+    } catch (e) {
+      console.error("Test print error:", e.message);
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end(`Test print error: ${e.message}`);
+    }
     return;
   }
 
@@ -490,7 +406,7 @@ const server = http.createServer((req, res) => {
         );
       }
 
-      printImage(parsed.data, parsed.filename, PRINTER_NAME, res);
+      printImage(parsed.data, parsed.filename, PRINTER_DEVICE, res);
     });
     return;
   }
