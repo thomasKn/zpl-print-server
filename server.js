@@ -35,10 +35,16 @@ let serialConfigured = false;
 // Configure serial port and write payload directly to the device (async, fire-and-forget)
 function sendToDevice(devicePath, payload) {
   if (!serialConfigured) {
-    execSync(`stty -f "${devicePath}" 9600 cs8 -cstopb -parenb`);
-    serialConfigured = true;
+    try {
+      execSync(`stty -f "${devicePath}" 9600 cs8 -cstopb -parenb`, { timeout: 3000 });
+      serialConfigured = true;
+    } catch (e) {
+      console.error("stty config failed (timeout or error):", e.message);
+      serialConfigured = true; // don't retry, continue anyway
+    }
   }
-  fs.open(devicePath, "w", (err, fd) => {
+  const flags = fs.constants.O_WRONLY | fs.constants.O_NONBLOCK;
+  fs.open(devicePath, flags, (err, fd) => {
     if (err) {
       console.error("Failed to open device:", err.message);
       return;
