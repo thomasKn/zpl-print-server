@@ -30,26 +30,10 @@ function resolvePrinter() {
   return findPrinterDevice();
 }
 
-let serialConfigured = false;
-
-// Configure serial port and write payload directly to the device (async, fire-and-forget)
+// Write payload to the device (async, fire-and-forget)
 function sendToDevice(devicePath, payload) {
-  console.log("[4a] sendToDevice called");
-  if (!serialConfigured) {
-    console.log("[4b] Running stty...");
-    try {
-      execSync(`stty -f "${devicePath}" 9600 cs8 -cstopb -parenb`, { timeout: 3000, killSignal: "SIGKILL" });
-      console.log("[4c] stty succeeded");
-      serialConfigured = true;
-    } catch (e) {
-      console.error("[4c] stty failed:", e.message);
-      serialConfigured = true;
-    }
-  }
-  console.log("[4d] Calling fs.open...");
   const flags = fs.constants.O_WRONLY | fs.constants.O_NONBLOCK;
   fs.open(devicePath, flags, (err, fd) => {
-    console.log("[4e] fs.open callback fired");
     if (err) {
       console.error("Failed to open device:", err.message);
       return;
@@ -59,7 +43,6 @@ function sendToDevice(devicePath, payload) {
       fs.close(fd, () => {});
     });
   });
-  console.log("[4f] sendToDevice returning");
 }
 
 const PRINTER_DEVICE = resolvePrinter();
