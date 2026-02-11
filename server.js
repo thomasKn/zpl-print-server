@@ -309,12 +309,15 @@ function printImage(fileBuffer, filename, devicePath, res) {
 
   try {
     // 1. Save uploaded file
+    console.log("[1] Saving uploaded file...");
     fs.writeFileSync(tmpInput, fileBuffer);
 
     // 2. Convert to BMP via sips
+    console.log("[2] Converting to BMP via sips...");
     convertToBmp(tmpInput, tmpBmp);
 
     // 3. Parse BMP → monochrome bitmap → TSPL payload
+    console.log("[3] Building TSPL payload...");
     const bmpBuffer = fs.readFileSync(tmpBmp);
     const { width, height, pixels } = parseBmp(bmpBuffer);
     const bitmap = toMonochromeBitmap(pixels, width, height);
@@ -322,11 +325,13 @@ function printImage(fileBuffer, filename, devicePath, res) {
     const payload = buildTsplPayload(bitmap, widthBytes, height, width);
 
     // 4. Send directly to device (async — doesn't block event loop)
+    console.log("[4] Sending to device...");
     sendToDevice(devicePath, payload);
+    console.log("[5] Cleaning up...");
     cleanup();
 
     const msg = `Sent ${filename} to ${devicePath} (TSPL ${width}x${height})`;
-    console.log(msg);
+    console.log("[6] Sending HTTP response");
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end(msg);
   } catch (e) {
