@@ -57,6 +57,10 @@ if (!PRINTER_DEVICE) {
   process.exit(1);
 }
 
+// Force exit on Ctrl+C even if child processes are stuck
+process.on("SIGINT", () => { console.log("\nShutting down..."); process.exit(0); });
+process.on("SIGTERM", () => { process.exit(0); });
+
 console.log(`Using printer: ${PRINTER_DEVICE} (direct serial)`);
 
 const HTML = `<!DOCTYPE html>
@@ -352,6 +356,14 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/") {
     res.writeHead(200, { "Content-Type": "text/html" });
     return res.end(HTML);
+  }
+
+  // Kill endpoint — shut down the server
+  if (req.method === "GET" && req.url === "/kill") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Server shutting down...");
+    console.log("Shutdown requested via /kill");
+    process.exit(0);
   }
 
   // Test-print endpoint — send a minimal TSPL text command
