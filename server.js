@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const http = require("http");
-const { execSync } = require("child_process");
+const { exec, execSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -30,26 +30,17 @@ function resolvePrinter() {
   return findPrinterDevice();
 }
 
-// Configure serial port baud rate using Python termios (opens with O_NONBLOCK so it won't hang)
-function configureSerial(devicePath) {
-  const script = `
-import os, termios
-fd = os.open("${devicePath}", os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY)
-a = termios.tcgetattr(fd)
-a[4] = a[5] = termios.B9600
-a[2] = (a[2] | termios.CS8) & ~termios.CSTOPB & ~termios.PARENB
-termios.tcsetattr(fd, termios.TCSANOW, a)
-os.close(fd)
-`.trim();
-  execSync(`python3 -c '${script}'`, { timeout: 5000 });
-}
-
-// Write payload to the device (async, fire-and-forget)
+// Write payload to the device via child process (fire-and-forget, never blocks event loop)
 function sendToDevice(devicePath, payload) {
-  fs.writeFile(devicePath, payload, (err) => {
-    if (err) console.error("Device write error:", err.message);
+  const tmpFile = path.join(os.tmpdir(), `tspl-${Date.now()}.bin`);
+  fs.writeFileSync(tmpFile, payload);
+  const cmd = `stty -f "${devicePath}" 9600 cs8 -cstopb -parenb && cat "${tmpFile}" > "${devicePath}"`;
+  const child = exec(cmd, { timeout: 30000 }, (err) => {
+    try { fs.unlinkSync(tmpFile); } catch {}
+    if (err) console.error("[DEVICE] Error:", err.message);
     else console.log("[DEVICE] Write complete");
   });
+  child.unref();
 }
 
 const PRINTER_DEVICE = resolvePrinter();
@@ -66,13 +57,7 @@ if (!PRINTER_DEVICE) {
   process.exit(1);
 }
 
-try {
-  configureSerial(PRINTER_DEVICE);
-  console.log(`Using printer: ${PRINTER_DEVICE} (serial configured at 9600 8N1)`);
-} catch (e) {
-  console.error(`Warning: could not configure serial port: ${e.message}`);
-  console.log(`Using printer: ${PRINTER_DEVICE} (unconfigured)`);
-}
+console.log(`Using printer: ${PRINTER_DEVICE} (direct serial)`);
 
 const HTML = `<!DOCTYPE html>
 <html><head><title>Label Print Server</title>
