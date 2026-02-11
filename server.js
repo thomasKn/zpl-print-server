@@ -32,17 +32,17 @@ function resolvePrinter() {
 
 let serialConfigured = false;
 
-// Configure serial port and write payload directly to the device (async)
-function sendToDevice(devicePath, payload, callback) {
+// Configure serial port and write payload directly to the device (async, fire-and-forget)
+function sendToDevice(devicePath, payload) {
   if (!serialConfigured) {
     execSync(`stty -f "${devicePath}" 9600 cs8 -cstopb -parenb`);
     serialConfigured = true;
   }
   const tmpFile = path.join(os.tmpdir(), `tspl-${Date.now()}.bin`);
   fs.writeFileSync(tmpFile, payload);
-  exec(`cat "${tmpFile}" > "${devicePath}"`, (err) => {
+  const child = exec(`cat "${tmpFile}" > "${devicePath}"`);
+  child.on("close", () => {
     try { fs.unlinkSync(tmpFile); } catch {}
-    callback(err);
   });
 }
 
@@ -318,19 +318,13 @@ function printImage(fileBuffer, filename, devicePath, res) {
     const payload = buildTsplPayload(bitmap, widthBytes, height, width);
 
     // 4. Send directly to device (async — doesn't block event loop)
-    sendToDevice(devicePath, payload, (err) => {
-      cleanup();
-      if (err) {
-        console.error("Device write error:", err.message);
-        res.writeHead(500, { "Content-Type": "text/plain" });
-        res.end(`Error writing to device: ${err.message}`);
-        return;
-      }
-      const msg = `Sent ${filename} to ${devicePath} (TSPL ${width}x${height})`;
-      console.log(msg);
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end(msg);
-    });
+    sendToDevice(devicePath, payload);
+    cleanup();
+
+    const msg = `Sent ${filename} to ${devicePath} (TSPL ${width}x${height})`;
+    console.log(msg);
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end(msg);
   } catch (e) {
     cleanup();
     console.error("TSPL conversion error:", e.message);
@@ -366,18 +360,11 @@ const server = http.createServer((req, res) => {
       `PRINT 1\r\n`;
 
     try {
-      sendToDevice(PRINTER_DEVICE, Buffer.from(tspl, "ascii"), (err) => {
-        if (err) {
-          console.error("Test print error:", err.message);
-          res.writeHead(500, { "Content-Type": "text/plain" });
-          res.end(`Test print error: ${err.message}`);
-          return;
-        }
-        const msg = `Test print sent to ${PRINTER_DEVICE}`;
-        console.log(msg);
-        res.writeHead(200, { "Content-Type": "text/plain" });
-        res.end(msg);
-      });
+      sendToDevice(PRINTER_DEVICE, Buffer.from(tspl, "ascii"));
+      const msg = `Test print sent to ${PRINTER_DEVICE}`;
+      console.log(msg);
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end(msg);
     } catch (e) {
       console.error("Test print error:", e.message);
       res.writeHead(500, { "Content-Type": "text/plain" });
