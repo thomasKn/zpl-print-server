@@ -27,32 +27,21 @@ function autoRegisterUsbPrinter() {
     const pathMatch = uri.match(/usb:\/\/[^/]+\/([^?]+)/);
     const queueName = pathMatch ? pathMatch[1] : "USBPrinter";
 
-    // Use -m everywhere (IPP Everywhere / driverless) for image rasterization
+    // Use -m raw so CUPS passes our TSPL bytes through unchanged
     try {
       execSync(
-        `lpadmin -p ${queueName} -E -v "${uri}" -m everywhere 2>/dev/null`
+        `lpadmin -p ${queueName} -E -v "${uri}" -m raw 2>/dev/null`
       );
       console.log(
-        `Auto-registered CUPS queue "${queueName}" -> ${uri} (driverless driver)`
+        `Auto-registered CUPS queue "${queueName}" -> ${uri} (raw mode)`
       );
       return queueName;
-    } catch {
-      // Fall back to generic PPD driver
-      try {
-        execSync(
-          `lpadmin -p ${queueName} -E -v "${uri}" -m drv:///sample.drv/generic.ppd 2>/dev/null`
-        );
-        console.log(
-          `Auto-registered CUPS queue "${queueName}" -> ${uri} (generic driver)`
-        );
-        return queueName;
-      } catch (e) {
-        console.error(
-          "Failed to auto-register USB printer in CUPS:",
-          e.message
-        );
-        return null;
-      }
+    } catch (e) {
+      console.error(
+        "Failed to auto-register USB printer in CUPS:",
+        e.message
+      );
+      return null;
     }
   } catch (e) {
     console.error("Failed to auto-register USB printer in CUPS:", e.message);
@@ -126,7 +115,7 @@ if (!PRINTER_NAME) {
     [
       "No USB printer detected. Options:",
       "  1. Connect a thermal printer via USB",
-      "  2. Set up a CUPS queue: lpadmin -p PrinterName -E -v <uri> -m everywhere",
+      "  2. Set up a CUPS queue: lpadmin -p PrinterName -E -v <uri> -m raw",
       "  3. Set LABEL_PRINTER env var to a CUPS queue name",
       "  4. Run: lpinfo -v   to list available printer URIs",
     ].join("\n")
@@ -276,29 +265,147 @@ function parseMultipart(buffer, contentType) {
   return { filename, contentType: fileContentType, data };
 }
 
-// Print an image/PDF file via CUPS
-function printImage(fileBuffer, filename, printer, res) {
-  const ext = path.extname(filename).toLowerCase();
-  const tmpFile = path.join(os.tmpdir(), `label-${Date.now()}${ext}`);
-  fs.writeFileSync(tmpFile, fileBuffer);
+// --- Image-to-TSPL conversion pipeline ---
 
-  exec(
-    `lp -d "${printer}" -o fit-to-page "${tmpFile}"`,
-    (err, stdout, stderr) => {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {}
-      if (err) {
-        console.error("Print error:", stderr || err.message);
-        res.writeHead(500, { "Content-Type": "text/plain" });
-        return res.end(`Print error: ${stderr || err.message}`);
-      }
-      const msg = `Sent ${filename} to ${printer}: ${stdout.trim()}`;
-      console.log(msg);
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end(msg);
-    }
+const TSPL_DPI = 203;
+const MAX_PRINT_WIDTH_DOTS = 832; // 4-inch print head at 203 DPI
+
+// Convert image to BMP using macOS built-in sips
+function convertToBmp(inputPath, bmpPath, maxWidth = MAX_PRINT_WIDTH_DOTS) {
+  execSync(
+    `sips -s format bmp --resampleWidth ${maxWidth} "${inputPath}" --out "${bmpPath}" 2>/dev/null`
   );
+}
+
+// Parse a BMP file buffer into { width, height, pixels } with top-down RGB order
+function parseBmp(buffer) {
+  const dataOffset = buffer.readUInt32LE(10);
+  const width = buffer.readInt32LE(18);
+  const height = buffer.readInt32LE(22);
+  const bpp = buffer.readUInt16LE(28);
+
+  if (bpp !== 24 && bpp !== 32) {
+    throw new Error(`Unsupported BMP bit depth: ${bpp}bpp (need 24 or 32)`);
+  }
+
+  const bytesPerPixel = bpp / 8;
+  const absHeight = Math.abs(height);
+  // BMP rows are padded to 4-byte boundaries
+  const rowSize = Math.ceil((width * bytesPerPixel) / 4) * 4;
+  const topDown = height < 0;
+
+  const pixels = Buffer.alloc(width * absHeight * 3);
+
+  for (let y = 0; y < absHeight; y++) {
+    // BMP stores rows bottom-up by default
+    const srcRow = topDown ? y : absHeight - 1 - y;
+    const srcOffset = dataOffset + srcRow * rowSize;
+    for (let x = 0; x < width; x++) {
+      const srcIdx = srcOffset + x * bytesPerPixel;
+      const dstIdx = (y * width + x) * 3;
+      // BMP stores BGR
+      pixels[dstIdx] = buffer[srcIdx + 2];     // R
+      pixels[dstIdx + 1] = buffer[srcIdx + 1]; // G
+      pixels[dstIdx + 2] = buffer[srcIdx];     // B
+    }
+  }
+
+  return { width, height: absHeight, pixels };
+}
+
+// Convert RGB pixels to 1-bit monochrome bitmap (packed, MSB first)
+// Black = bit set (1), White = bit clear (0)
+function toMonochromeBitmap(pixels, width, height) {
+  const widthBytes = Math.ceil(width / 8);
+  const bitmap = Buffer.alloc(widthBytes * height);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 3;
+      const gray = (pixels[idx] + pixels[idx + 1] + pixels[idx + 2]) / 3;
+      if (gray < 128) {
+        // Black pixel — set bit (MSB first)
+        const byteIdx = y * widthBytes + Math.floor(x / 8);
+        bitmap[byteIdx] |= 0x80 >> (x % 8);
+      }
+    }
+  }
+
+  return bitmap;
+}
+
+// Build a complete TSPL payload with BITMAP command
+function buildTsplPayload(bitmap, widthBytes, height, widthDots) {
+  const widthMm = Math.round((widthDots / TSPL_DPI) * 25.4);
+  const heightMm = Math.round((height / TSPL_DPI) * 25.4);
+
+  const header =
+    `SIZE ${widthMm} mm, ${heightMm} mm\r\n` +
+    `GAP 3 mm, 0\r\n` +
+    `CLS\r\n` +
+    `BITMAP 0,0,${widthBytes},${height},0,`;
+
+  const footer = `\r\nPRINT 1\r\n`;
+
+  const headerBuf = Buffer.from(header, "ascii");
+  const footerBuf = Buffer.from(footer, "ascii");
+
+  return Buffer.concat([headerBuf, bitmap, footerBuf]);
+}
+
+// Print an image/PDF file via TSPL over CUPS raw queue
+function printImage(fileBuffer, filename, printer, res) {
+  const stamp = Date.now();
+  const ext = path.extname(filename).toLowerCase();
+  const tmpInput = path.join(os.tmpdir(), `label-${stamp}${ext}`);
+  const tmpBmp = path.join(os.tmpdir(), `label-${stamp}.bmp`);
+  const tmpTspl = path.join(os.tmpdir(), `label-${stamp}.tspl`);
+
+  const cleanup = () => {
+    for (const f of [tmpInput, tmpBmp, tmpTspl]) {
+      try { fs.unlinkSync(f); } catch {}
+    }
+  };
+
+  try {
+    // 1. Save uploaded file
+    fs.writeFileSync(tmpInput, fileBuffer);
+
+    // 2. Convert to BMP via sips
+    convertToBmp(tmpInput, tmpBmp);
+
+    // 3. Parse BMP → monochrome bitmap → TSPL payload
+    const bmpBuffer = fs.readFileSync(tmpBmp);
+    const { width, height, pixels } = parseBmp(bmpBuffer);
+    const bitmap = toMonochromeBitmap(pixels, width, height);
+    const widthBytes = Math.ceil(width / 8);
+    const payload = buildTsplPayload(bitmap, widthBytes, height, width);
+
+    // 4. Write TSPL payload to temp file
+    fs.writeFileSync(tmpTspl, payload);
+
+    // 5. Send via lp raw
+    exec(
+      `lp -d "${printer}" -o raw "${tmpTspl}"`,
+      (err, stdout, stderr) => {
+        cleanup();
+        if (err) {
+          console.error("Print error:", stderr || err.message);
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          return res.end(`Print error: ${stderr || err.message}`);
+        }
+        const msg = `Sent ${filename} to ${printer} (TSPL ${width}x${height}): ${stdout.trim()}`;
+        console.log(msg);
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end(msg);
+      }
+    );
+  } catch (e) {
+    cleanup();
+    console.error("TSPL conversion error:", e.message);
+    res.writeHead(500, { "Content-Type": "text/plain" });
+    res.end(`Error converting image: ${e.message}`);
+  }
 }
 
 const server = http.createServer((req, res) => {
@@ -316,6 +423,33 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/") {
     res.writeHead(200, { "Content-Type": "text/html" });
     return res.end(HTML);
+  }
+
+  // Test-print endpoint — send a minimal TSPL text command
+  if (req.method === "GET" && req.url === "/test-print") {
+    const tspl =
+      `SIZE 100 mm, 30 mm\r\n` +
+      `GAP 3 mm, 0\r\n` +
+      `CLS\r\n` +
+      `TEXT 50,10,"4",0,1,1,"TSPL TEST OK"\r\n` +
+      `PRINT 1\r\n`;
+
+    const tmpFile = path.join(os.tmpdir(), `test-${Date.now()}.tspl`);
+    fs.writeFileSync(tmpFile, tspl, "ascii");
+
+    exec(`lp -d "${PRINTER_NAME}" -o raw "${tmpFile}"`, (err, stdout, stderr) => {
+      try { fs.unlinkSync(tmpFile); } catch {}
+      if (err) {
+        console.error("Test print error:", stderr || err.message);
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        return res.end(`Test print error: ${stderr || err.message}`);
+      }
+      const msg = `Test print sent to ${PRINTER_NAME}: ${stdout.trim()}`;
+      console.log(msg);
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end(msg);
+    });
+    return;
   }
 
   // Print endpoint
