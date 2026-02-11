@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const http = require("http");
-const { exec, execSync } = require("child_process");
+const { execSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -38,11 +38,15 @@ function sendToDevice(devicePath, payload) {
     execSync(`stty -f "${devicePath}" 9600 cs8 -cstopb -parenb`);
     serialConfigured = true;
   }
-  const tmpFile = path.join(os.tmpdir(), `tspl-${Date.now()}.bin`);
-  fs.writeFileSync(tmpFile, payload);
-  const child = exec(`cat "${tmpFile}" > "${devicePath}"`);
-  child.on("close", () => {
-    try { fs.unlinkSync(tmpFile); } catch {}
+  fs.open(devicePath, "w", (err, fd) => {
+    if (err) {
+      console.error("Failed to open device:", err.message);
+      return;
+    }
+    fs.write(fd, payload, (err) => {
+      if (err) console.error("Failed to write to device:", err.message);
+      fs.close(fd, () => {});
+    });
   });
 }
 
